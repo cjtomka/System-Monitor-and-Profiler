@@ -1,0 +1,102 @@
+package com.example.monitor.viewmodel;
+
+import com.example.monitor.protocol.Message;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+/** Turns the snapshot history into what the CPU graph draws. Pure: no JavaFX, easy to test. */
+public final class CpuSeries {
+    private CpuSeries() {}
+
+    /** x is seconds relative to the newest snapshot (zero or negative); pct is 0..100. */
+    public record Point(double x, double pct) {}
+
+    public record Stats(double latest, double average, double max, int samples) {
+        static final Stats NONE = new Stats(Double.NaN, Double.NaN, Double.NaN, 0);
+    }
+
+    /** Disjoint runs of points: the line is broken wherever data is missing or time goes backwards. */
+    public record Series(List<List<Point>> segments, double windowSeconds, Stats stats) {
+        public static Series empty(double windowSeconds) {
+            return new Series(List.of(), windowSeconds > 0 ? windowSeconds : 60.0, Stats.NONE);
+        }
+
+        public boolean isEmpty() {
+            return stats.samples() == 0;
+        }
+    }
+
+    /**
+     * @param history          oldest first, as MetricsModel.history() provides it
+     * @param windowSeconds    how much time to show; zero or less means the whole buffer
+     * @param maxPointsPerSegment above this a segment is decimated, keeping each bucket's peak
+     */
+    public static Series build(List<Message.Snapshot> history, double windowSeconds, int maxPointsPerSegment) {
+        if (maxPointsPerSegment < 2) throw new IllegalArgumentException("maxPointsPerSegment must be at least 2");
+        if (history.isEmpty()) return Series.empty(windowSeconds);
+
+        long newestTs = history.get(history.size() - 1).tsMs();
+        long oldestTs = history.get(0).tsMs();
+        double window = windowSeconds > 0 ? windowSeconds : Math.max((newestTs - oldestTs) / 1000.0, 1.0);
+
+        List<List<Point>> segments = new ArrayList<>();
+        List<Point> current = new ArrayList<>();
+        long prevTs = Long.MIN_VALUE;
+        double sum = 0, max = 0, latest = Double.NaN;
+        int samples = 0;
+
+        for (Message.Snapshot s : history) {
+            double x = (s.tsMs() - newestTs) / 1000.0;
+            if (x < -window) continue;                                  // older than the window
+
+            Message.CpuStats cpu = s.cpu();
+            if (cpu == null || Double.isNaN(cpu.totalPct())) {          // warming up, or the collector failed
+                flush(current, segments);
+                current = new ArrayList<>();
+                prevTs = Long.MIN_VALUE;
+                continue;
+            }
+            if (s.tsMs() < prevTs) {                                    // the clock went backwards
+                flush(current, segments);
+                current = new ArrayList<>();
+            }
+            double pct = Math.max(0.0, Math.min(100.0, cpu.totalPct()));
+            current.add(new Point(x, pct));
+            prevTs = s.tsMs();
+
+            sum += pct;
+            max = Math.max(max, pct);
+            latest = pct;
+            samples++;
+        }
+        flush(current, segments);
+
+        List<List<Point>> out = new ArrayList<>(segments.size());
+        for (List<Point> seg : segments) out.add(decimate(seg, maxPointsPerSegment));
+
+        Stats stats = samples == 0 ? Stats.NONE : new Stats(latest, sum / samples, max, samples);
+        return new Series(Collections.unmodifiableList(out), window, stats);
+    }
+
+    private static void flush(List<Point> segment, List<List<Point>> into) {
+        if (!segment.isEmpty()) into.add(segment);
+    }
+
+    /** At most `max` points, one per bucket, each the highest of its bucket, so spikes survive. */
+    static List<Point> decimate(List<Point> pts, int max) {
+        int n = pts.size();
+        if (n <= max) return pts;
+        List<Point> out = new ArrayList<>(max);
+        for (int b = 0; b < max; b++) {
+            int from = (int) ((long) b * n / max);
+            int to = (int) ((long) (b + 1) * n / max);
+            Point best = pts.get(from);
+            for (int i = from + 1; i < to; i++) {
+                if (pts.get(i).pct() > best.pct()) best = pts.get(i);
+            }
+            out.add(best);
+        }
+        return out;
+    }
+}

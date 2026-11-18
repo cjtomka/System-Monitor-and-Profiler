@@ -1,0 +1,112 @@
+package com.example.monitor.viewmodel;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import com.example.monitor.protocol.Message;
+import com.example.monitor.viewmodel.CpuSeries.Point;
+import com.example.monitor.viewmodel.CpuSeries.Series;
+import java.util.ArrayList;
+import java.util.List;
+import org.junit.jupiter.api.Test;
+
+class CpuSeriesTest {
+
+    private static Message.Snapshot s(long seq, long tsMs, Double pct) {
+        Message.CpuStats cpu = pct == null ? null : new Message.CpuStats(pct, List.of(pct));
+        return new Message.Snapshot(seq, tsMs, false, cpu, null, null, null, 0);
+    }
+
+    @Test
+    void positionsPointsRelativeToTheNewestSnapshot() {
+        Series r = CpuSeries.build(List.of(s(1, 1000, 10.0), s(2, 2000, 20.0), s(3, 3000, 30.0)), 60, 100);
+        assertEquals(1, r.segments().size());
+        List<Point> pts = r.segments().get(0);
+        assertEquals(-2.0, pts.get(0).x(), 1e-9);
+        assertEquals(10.0, pts.get(0).pct(), 1e-9);
+        assertEquals(0.0, pts.get(2).x(), 1e-9);
+        assertEquals(60.0, r.windowSeconds(), 1e-9);
+    }
+
+    @Test
+    void theWindowKeepsOnlyRecentPoints() {
+        List<Message.Snapshot> h = new ArrayList<>();
+        for (int i = 0; i <= 5; i++) h.add(s(i + 1, i * 1000L, 10.0 + i));
+        Series r = CpuSeries.build(h, 2, 100);
+        List<Point> pts = r.segments().get(0);
+        assertEquals(3, pts.size());                                   // x = -2, -1, 0
+        assertEquals(-2.0, pts.get(0).x(), 1e-9);
+        assertEquals(3, r.stats().samples());
+    }
+
+    @Test
+    void aZeroWindowMeansTheWholeSpan() {
+        List<Message.Snapshot> h = new ArrayList<>();
+        for (int i = 0; i <= 5; i++) h.add(s(i + 1, i * 1000L, 10.0));
+        Series r = CpuSeries.build(h, 0, 100);
+        assertEquals(6, r.segments().get(0).size());
+        assertEquals(5.0, r.windowSeconds(), 1e-9);
+    }
+
+    @Test
+    void missingCpuSplitsTheLineAndIsExcludedFromStats() {
+        Series r = CpuSeries.build(List.of(s(1, 1000, 10.0), s(2, 2000, null), s(3, 3000, 30.0), s(4, 4000, 50.0)), 60, 100);
+        assertEquals(2, r.segments().size());
+        assertEquals(1, r.segments().get(0).size());
+        assertEquals(2, r.segments().get(1).size());
+        assertEquals(3, r.stats().samples());
+        assertEquals(30.0, r.stats().average(), 1e-9);
+    }
+
+    @Test
+    void aClockGoingBackwardsStartsANewSegment() {
+        Series r = CpuSeries.build(List.of(s(1, 1000, 10.0), s(2, 2000, 20.0), s(3, 1500, 30.0), s(4, 2500, 40.0)), 60, 100);
+        assertEquals(2, r.segments().size());
+        assertEquals(2, r.segments().get(0).size());
+        assertEquals(2, r.segments().get(1).size());
+        assertEquals(-1.0, r.segments().get(1).get(0).x(), 1e-9);      // ts 1500 against the newest, 2500
+    }
+
+    @Test
+    void statsAreLatestAverageAndMax() {
+        Series r = CpuSeries.build(List.of(s(1, 1000, 10.0), s(2, 2000, 20.0), s(3, 3000, 60.0)), 60, 100);
+        assertEquals(60.0, r.stats().latest(), 1e-9);
+        assertEquals(30.0, r.stats().average(), 1e-9);
+        assertEquals(60.0, r.stats().max(), 1e-9);
+        assertEquals(3, r.stats().samples());
+        assertFalse(r.isEmpty());
+    }
+
+    @Test
+    void clampsOutOfRangeValuesAndSkipsNaN() {
+        Series r = CpuSeries.build(List.of(s(1, 1000, 150.0), s(2, 2000, -5.0), s(3, 3000, Double.NaN)), 60, 100);
+        List<Point> all = new ArrayList<>();
+        r.segments().forEach(all::addAll);
+        assertEquals(2, all.size());
+        assertEquals(100.0, all.get(0).pct(), 1e-9);
+        assertEquals(0.0, all.get(1).pct(), 1e-9);
+        assertEquals(2, r.stats().samples());
+    }
+
+    @Test
+    void anEmptyHistoryStillKeepsTheWindowForTheAxes() {
+        Series r = CpuSeries.build(List.of(), 300, 100);
+        assertTrue(r.segments().isEmpty());
+        assertTrue(r.isEmpty());
+        assertEquals(300.0, r.windowSeconds(), 1e-9);
+        assertEquals(60.0, CpuSeries.build(List.of(), 0, 100).windowSeconds(), 1e-9);
+    }
+
+    @Test
+    void decimationKeepsPeaksAndBoundsTheSize() {
+        List<Point> pts = new ArrayList<>();
+        for (int i = 0; i < 10_000; i++) pts.add(new Point(i / 10.0, i == 7321 ? 99.0 : 5.0));
+
+        List<Point> out = CpuSeries.decimate(pts, 100);
+        assertEquals(100, out.size());
+        assertTrue(out.stream().anyMatch(p -> p.pct() == 99.0), "the spike must survive");
+        for (int i = 1; i < out.size(); i++) assertTrue(out.get(i).x() > out.get(i - 1).x());
+
+        List<Point> small = pts.subList(0, 50);
+        assertSame(small, CpuSeries.decimate(small, 100));            // under the limit: returned as is
+    }
+}
